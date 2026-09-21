@@ -1,9 +1,9 @@
 // oe.physics: small impulse-based physics. Circles and axis-aligned rectangles, no rotation.
-// ponytail: O(n^2) broadphase, fine for a few hundred bodies; add a spatial grid if you need thousands.
 // ponytail: no rotation/joints; switch to Box2D v3 (also C) if a game needs them.
 #include <lua.h>
 #include <lauxlib.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -26,6 +26,18 @@ typedef struct {
     Contact *contacts;
     int nc, ccap;
     unsigned nextId;
+
+    // Broadphase, rebuilt once per world:update() call: dynamic bodies go in a
+    // uniform grid (bucketed by center cell), static bodies are checked against
+    // every dynamic body directly (there are usually few of them, e.g. walls).
+    Body **dyn;
+    int ndyn, dynCap;
+    Body **statc;
+    int nstat, statCap;
+    int32_t *cellx, *celly;  // per-dynamic-body cell coords, parallel to dyn[]
+    int *gridHead, *gridNext;  // gridHead[hash] -> dyn index, chained via gridNext
+    int gridCap;
+    float cellSize;
 } World;
 
 // World uservalue table: [lightuserdata body] = body userdata (keeps bodies alive), .callback = fn
@@ -48,8 +60,12 @@ static int w_gc(lua_State *L) {
     World *w = checkworld(L);
     free(w->bodies);
     free(w->contacts);
-    w->bodies = NULL;
-    w->contacts = NULL;
+    free(w->dyn);
+    free(w->statc);
+    free(w->cellx);
+    free(w->celly);
+    free(w->gridHead);
+    free(w->gridNext);
     return 0;
 }
 
@@ -163,44 +179,138 @@ static void addcontact(lua_State *L, World *w, Body *a, Body *b, float nx, float
     w->contacts[w->nc++] = (Contact){a, b, a->id, b->id, nx, ny};
 }
 
-static void step(lua_State *L, World *w, float dt) {
+// Resolves one candidate pair. Order of a/b only matters for the contact
+// normal's direction, so callers pick it however's convenient for dedup.
+static void process_pair(lua_State *L, World *w, Body *a, Body *b) {
+    float im = a->invMass + b->invMass, nx, ny, depth;
+    if (im == 0 || !collide(a, b, &nx, &ny, &depth)) return;
+    addcontact(L, w, a, b, nx, ny);
+
+    // Push apart, split by inverse mass.
+    float corr = fmaxf(depth - 0.01f, 0) / im * 0.8f;
+    a->x -= nx * corr * a->invMass; a->y -= ny * corr * a->invMass;
+    b->x += nx * corr * b->invMass; b->y += ny * corr * b->invMass;
+
+    float rvx = b->vx - a->vx, rvy = b->vy - a->vy, vn = rvx * nx + rvy * ny;
+    if (vn > 0) return;  // already separating
+    float e = fmaxf(a->restitution, b->restitution);
+    float jn = -(1 + e) * vn / im;
+    a->vx -= jn * nx * a->invMass; a->vy -= jn * ny * a->invMass;
+    b->vx += jn * nx * b->invMass; b->vy += jn * ny * b->invMass;
+
+    // Coulomb friction along the tangent.
+    float tx = rvx - vn * nx, ty = rvy - vn * ny, tl = sqrtf(tx * tx + ty * ty);
+    if (tl < 1e-6f) return;
+    tx /= tl; ty /= tl;
+    float mu = sqrtf(a->friction * b->friction);
+    float jt = fmaxf(-jn * mu, fminf(jn * mu, -(rvx * tx + rvy * ty) / im));
+    a->vx -= jt * tx * a->invMass; a->vy -= jt * ty * a->invMass;
+    b->vx += jt * tx * b->invMass; b->vy += jt * ty * b->invMass;
+}
+
+static int next_pow2(int n) {
+    int p = 16;
+    while (p < n) p *= 2;
+    return p;
+}
+
+static uint32_t cellhash(int32_t cx, int32_t cy, uint32_t cap) {
+    uint32_t h = (uint32_t)cx * 92837111u ^ (uint32_t)cy * 689287499u;
+    return h & (cap - 1);
+}
+
+// Rebuilds the dynamic/static split and the dynamic-body grid from the
+// world's current body list. Done once per world:update(), not per substep:
+// bodies move little enough within one update that a slightly stale grid
+// doesn't miss collisions in practice, and it's much cheaper this way.
+static void build_grid(lua_State *L, World *w) {
+    w->ndyn = 0;
+    w->nstat = 0;
+    if (w->dynCap < w->n) {
+        w->dynCap = w->n;
+        w->dyn = realloc(w->dyn, sizeof *w->dyn * (size_t)w->dynCap);
+        w->cellx = realloc(w->cellx, sizeof *w->cellx * (size_t)w->dynCap);
+        w->celly = realloc(w->celly, sizeof *w->celly * (size_t)w->dynCap);
+        w->gridNext = realloc(w->gridNext, sizeof *w->gridNext * (size_t)w->dynCap);
+        if (!w->dyn || !w->cellx || !w->celly || !w->gridNext) luaL_error(L, "out of memory");
+    }
+    if (w->statCap < w->n) {
+        w->statCap = w->n;
+        w->statc = realloc(w->statc, sizeof *w->statc * (size_t)w->statCap);
+        if (!w->statc) luaL_error(L, "out of memory");
+    }
+
+    float maxSize = 0;
     for (int i = 0; i < w->n; i++) {
         Body *b = w->bodies[i];
-        if (!b->invMass) continue;
+        if (b->invMass) {
+            w->dyn[w->ndyn++] = b;
+            maxSize = fmaxf(maxSize, fmaxf(b->w, b->h));
+        } else {
+            w->statc[w->nstat++] = b;
+        }
+    }
+    w->cellSize = fmaxf(maxSize * 2, 16.0f);  // cells at least ~2x the largest dynamic body
+
+    int cap = next_pow2(w->ndyn * 2);
+    if (cap != w->gridCap) {
+        w->gridCap = cap;
+        w->gridHead = realloc(w->gridHead, sizeof *w->gridHead * (size_t)cap);
+        if (!w->gridHead) luaL_error(L, "out of memory");
+    }
+    for (int i = 0; i < w->gridCap; i++) w->gridHead[i] = -1;
+    for (int i = 0; i < w->ndyn; i++) {
+        Body *b = w->dyn[i];
+        int32_t cx = (int32_t)floorf(b->x / w->cellSize), cy = (int32_t)floorf(b->y / w->cellSize);
+        w->cellx[i] = cx;
+        w->celly[i] = cy;
+        uint32_t h = cellhash(cx, cy, (uint32_t)w->gridCap);
+        w->gridNext[i] = w->gridHead[h];
+        w->gridHead[h] = i;
+    }
+}
+
+// Checks dynamic bodies against nearby dynamic bodies only. Each unordered
+// pair is visited exactly once: same-cell pairs are deduped by dyn-index,
+// and the 4 offsets (not their mirrors) mean each cell-to-neighbor relation
+// is only walked from one side.
+static void collide_grid(lua_State *L, World *w) {
+    static const int off[5][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}, {-1, 1}};
+    for (int oi = 0; oi < 5; oi++) {
+        for (int i = 0; i < w->ndyn; i++) {
+            int32_t ncx = w->cellx[i] + off[oi][0], ncy = w->celly[i] + off[oi][1];
+            uint32_t h = cellhash(ncx, ncy, (uint32_t)w->gridCap);
+            for (int j = w->gridHead[h]; j != -1; j = w->gridNext[j]) {
+                if (w->cellx[j] != ncx || w->celly[j] != ncy) continue;  // hash collision, different cell
+                if (oi == 0 && j <= i) continue;  // same cell: only process each pair once
+                Body *A = w->dyn[i], *B = w->dyn[j];
+                if (A->id < B->id) process_pair(L, w, A, B); else process_pair(L, w, B, A);
+            }
+        }
+    }
+}
+
+// Static bodies (walls, floors, platforms) are usually few, so every dynamic
+// body just checks against all of them directly rather than gridding them too.
+static void collide_static(lua_State *L, World *w) {
+    for (int i = 0; i < w->ndyn; i++) {
+        for (int j = 0; j < w->nstat; j++) {
+            Body *A = w->dyn[i], *B = w->statc[j];
+            if (A->id < B->id) process_pair(L, w, A, B); else process_pair(L, w, B, A);
+        }
+    }
+}
+
+static void step(lua_State *L, World *w, float dt) {
+    for (int i = 0; i < w->ndyn; i++) {
+        Body *b = w->dyn[i];
         b->vx += w->gx * dt;
         b->vy += w->gy * dt;
         b->x += b->vx * dt;
         b->y += b->vy * dt;
     }
-    for (int i = 0; i < w->n; i++) {
-        for (int j = i + 1; j < w->n; j++) {
-            Body *a = w->bodies[i], *b = w->bodies[j];
-            float im = a->invMass + b->invMass, nx, ny, depth;
-            if (im == 0 || !collide(a, b, &nx, &ny, &depth)) continue;
-            addcontact(L, w, a, b, nx, ny);
-
-            // Push apart, split by inverse mass.
-            float corr = fmaxf(depth - 0.01f, 0) / im * 0.8f;
-            a->x -= nx * corr * a->invMass; a->y -= ny * corr * a->invMass;
-            b->x += nx * corr * b->invMass; b->y += ny * corr * b->invMass;
-
-            float rvx = b->vx - a->vx, rvy = b->vy - a->vy, vn = rvx * nx + rvy * ny;
-            if (vn > 0) continue;  // already separating
-            float e = fmaxf(a->restitution, b->restitution);
-            float jn = -(1 + e) * vn / im;
-            a->vx -= jn * nx * a->invMass; a->vy -= jn * ny * a->invMass;
-            b->vx += jn * nx * b->invMass; b->vy += jn * ny * b->invMass;
-
-            // Coulomb friction along the tangent.
-            float tx = rvx - vn * nx, ty = rvy - vn * ny, tl = sqrtf(tx * tx + ty * ty);
-            if (tl < 1e-6f) continue;
-            tx /= tl; ty /= tl;
-            float mu = sqrtf(a->friction * b->friction);
-            float jt = fmaxf(-jn * mu, fminf(jn * mu, -(rvx * tx + rvy * ty) / im));
-            a->vx -= jt * tx * a->invMass; a->vy -= jt * ty * a->invMass;
-            b->vx += jt * tx * b->invMass; b->vy += jt * ty * b->invMass;
-        }
-    }
+    collide_grid(L, w);
+    collide_static(L, w);
 }
 
 // world:update(dt) -- substeps at <= 1/120s to limit tunneling, then fires callbacks
@@ -210,6 +320,7 @@ static int w_update(lua_State *L) {
     if (dt > 0.25f) dt = 0.25f;  // don't explode after a long stall
     int steps = (int)ceilf(dt * 120);
     w->nc = 0;
+    build_grid(L, w);
     for (int i = 0; i < steps; i++) step(L, w, dt / (float)steps);
 
     lua_getiuservalue(L, 1, 1);
